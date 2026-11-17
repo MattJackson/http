@@ -1109,6 +1109,22 @@ impl<'a> From<StandardHeader> for HdrName<'a> {
 }
 
 impl HeaderName {
+    /// Parses a lowercase name while retaining the supplied shared backing for
+    /// custom names. Independently cloned names retain the same owner.
+    pub fn from_lowercase_shared(src: Bytes) -> Result<HeaderName, InvalidHeaderName> {
+        let mut buf = uninit_u8_array();
+        match parse_hdr(&src, &mut buf, &HEADER_CHARS_H2)?.inner {
+            Repr::Standard(std) => Ok(std.into()),
+            Repr::Custom(_) => {
+                if src.iter().any(|b| HEADER_CHARS_H2[*b as usize] == 0) {
+                    return Err(InvalidHeaderName::new());
+                }
+                let value = ByteStr::from_utf8(src).map_err(|_| InvalidHeaderName::new())?;
+                Ok(Custom(value).into())
+            }
+        }
+    }
+
     /// Converts a slice of bytes to an HTTP header name.
     ///
     /// This function normalizes the input.

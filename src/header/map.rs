@@ -476,7 +476,170 @@ macro_rules! insert_phase_one {
 
 // ===== impl HeaderMap =====
 
+/// A checked, allocation-free description of one header map construction.
+/// The quote covers requested container storage, not names, values, allocator
+/// overhead or subsequent mutations of the resulting ordinary map.
+#[derive(Debug)]
+pub struct HeaderMapPlan {
+    values: usize,
+    raw: usize,
+    entries: usize,
+    extra: usize,
+    bytes: usize,
+}
+
+/// Failure to plan or construct a bounded header projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectionError {
+    /// The requested count or allocation extent cannot be represented.
+    Capacity,
+    /// A fallible allocation could not provide the exact planned capacity.
+    Allocation,
+    /// The iterator did not produce exactly the planned count.
+    Count,
+    /// A caller could not produce a valid name/value pair.
+    InvalidField,
+}
+
+impl fmt::Display for ProjectionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Capacity => "header projection exceeds capacity",
+            Self::Allocation => "header projection allocation failed",
+            Self::Count => "header projection count mismatch",
+            Self::InvalidField => "invalid header projection field",
+        })
+    }
+}
+
+impl std::error::Error for ProjectionError {}
+
+impl HeaderMapPlan {
+    /// Plan storage for exactly `values` input pairs, including duplicates.
+    pub fn for_values(values: usize) -> Result<Self, ProjectionError> {
+        let raw = if values == 0 {
+            0
+        } else {
+            to_raw_capacity(values)
+                .map_err(|_| ProjectionError::Capacity)?
+                .checked_next_power_of_two()
+                .filter(|raw| *raw <= MAX_SIZE)
+                .ok_or(ProjectionError::Capacity)?
+        };
+        let entries = usable_capacity(raw);
+        let extra = values.saturating_sub(1);
+        let bytes = raw
+            .checked_mul(mem::size_of::<Pos>())
+            .and_then(|n| {
+                n.checked_add(entries.checked_mul(mem::size_of::<Bucket<HeaderValue>>())?)
+            })
+            .and_then(|n| {
+                n.checked_add(extra.checked_mul(mem::size_of::<ExtraValue<HeaderValue>>())?)
+            })
+            .ok_or(ProjectionError::Capacity)?;
+        Ok(Self {
+            values,
+            raw,
+            entries,
+            extra,
+            bytes,
+        })
+    }
+
+    /// Exact requested bytes for the three private container buffers.
+    pub fn allocation_bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Exact number of input pairs required by this plan.
+    pub fn values(&self) -> usize {
+        self.values
+    }
+}
+
+fn projection_buffer<T>(capacity: usize) -> Result<Vec<T>, ProjectionError> {
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(capacity)
+        .map_err(|_| ProjectionError::Allocation)?;
+    // In particular, indices can become a boxed slice without a shrinking
+    // allocation. Never silently accept storage outside the library quote.
+    if buffer.capacity() != capacity {
+        return Err(ProjectionError::Allocation);
+    }
+    Ok(buffer)
+}
+
 impl HeaderMap {
+    /// Construct exactly one planned map without growing its private buffers.
+    /// Names and values are moved unchanged. Any error drops partial storage
+    /// before returning. Iterator size hints are not trusted.
+    pub fn try_from_plan<I>(plan: HeaderMapPlan, mut fields: I) -> Result<Self, ProjectionError>
+    where
+        I: Iterator<Item = Result<(HeaderName, HeaderValue), ProjectionError>>,
+    {
+        let mut indices = projection_buffer(plan.raw)?;
+        let entries = projection_buffer(plan.entries)?;
+        let extra_values = projection_buffer(plan.extra)?;
+        indices.resize(plan.raw, Pos::none());
+        let mut map = Self {
+            mask: plan.raw.saturating_sub(1) as Size,
+            indices: indices.into_boxed_slice(),
+            entries,
+            extra_values,
+            danger: Danger::Red(RandomState::new()),
+        };
+        for _ in 0..plan.values {
+            let (key, value) = fields.next().ok_or(ProjectionError::Count)??;
+            map.append_planned(key, value)?;
+        }
+        if fields.next().is_some() {
+            return Err(ProjectionError::Count);
+        }
+        Ok(map)
+    }
+
+    fn append_planned(
+        &mut self,
+        key: HeaderName,
+        value: HeaderValue,
+    ) -> Result<(), ProjectionError> {
+        // A logical input slot is checked by the caller, and each concrete
+        // destination is checked before the existing insertion primitives push.
+        insert_phase_one!(
+            self,
+            key,
+            probe,
+            pos,
+            hash,
+            danger,
+            {
+                let _ = danger;
+                if self.entries.len() == self.entries.capacity() {
+                    return Err(ProjectionError::Capacity);
+                }
+                let index = self.entries.len();
+                self.try_insert_entry(hash, key, value)
+                    .map_err(|_| ProjectionError::Capacity)?;
+                self.indices[probe] = Pos::new(index, hash);
+            },
+            {
+                if self.extra_values.len() == self.extra_values.capacity() {
+                    return Err(ProjectionError::Capacity);
+                }
+                append_value(pos, &mut self.entries[pos], &mut self.extra_values, value);
+            },
+            {
+                if self.entries.len() == self.entries.capacity() {
+                    return Err(ProjectionError::Capacity);
+                }
+                self.try_insert_phase_two(key, value, hash, probe, danger)
+                    .map_err(|_| ProjectionError::Capacity)?;
+            }
+        );
+        Ok(())
+    }
+
     /// Create an empty `HeaderMap`.
     ///
     /// The map will be created without any capacity. This function will not
@@ -4033,6 +4196,118 @@ fn test_bounds() {
     check_bounds::<ValueIter<'static, ()>>();
     check_bounds::<ValueIterMut<'static, ()>>();
     check_bounds::<ValueDrain<'static, ()>>();
+}
+
+#[test]
+fn projection_quote_matches_private_extents_without_growth() {
+    for count in [0, 1, 2, 3, 6, 12, 256, 4096] {
+        for unique in [false, true] {
+            let plan = HeaderMapPlan::for_values(count).unwrap();
+            let quote = plan.allocation_bytes();
+            let fields = (0..count).map(|i| {
+                let key = if unique {
+                    format!("x-field-{i}")
+                } else {
+                    "x-field".to_owned()
+                };
+                Ok((
+                    HeaderName::from_bytes(key.as_bytes()).unwrap(),
+                    HeaderValue::from_static("value"),
+                ))
+            });
+            let mut map = HeaderMap::try_from_plan(plan, fields).unwrap();
+            assert_eq!(map.len(), count);
+            assert!(map.danger.is_red());
+            assert_eq!(
+                quote,
+                map.indices.len() * mem::size_of::<Pos>()
+                    + map.entries.capacity() * mem::size_of::<Bucket<HeaderValue>>()
+                    + map.extra_values.capacity() * mem::size_of::<ExtraValue<HeaderValue>>()
+            );
+            let pointers = (
+                map.indices.as_ptr(),
+                map.entries.as_ptr(),
+                map.extra_values.as_ptr(),
+            );
+            let capacities = (
+                map.indices.len(),
+                map.entries.capacity(),
+                map.extra_values.capacity(),
+            );
+            // Reuse the exact planned buffers and exercise the constructor's
+            // insertion primitive at every position, including duplicate chains.
+            map.entries.clear();
+            map.extra_values.clear();
+            map.indices.fill(Pos::none());
+            for i in 0..count {
+                let key = if unique {
+                    format!("x-collision-candidate-{i}")
+                } else {
+                    "x-field".to_owned()
+                };
+                map.append_planned(
+                    HeaderName::from_bytes(key.as_bytes()).unwrap(),
+                    HeaderValue::from_static("v"),
+                )
+                .unwrap();
+                assert_eq!(
+                    pointers,
+                    (
+                        map.indices.as_ptr(),
+                        map.entries.as_ptr(),
+                        map.extra_values.as_ptr()
+                    )
+                );
+                assert_eq!(
+                    capacities,
+                    (
+                        map.indices.len(),
+                        map.entries.capacity(),
+                        map.extra_values.capacity()
+                    )
+                );
+                assert!(map.danger.is_red());
+            }
+        }
+    }
+}
+
+#[test]
+fn projection_interleaved_duplicates_and_replacement_keep_buffers() {
+    let fields = ["x-a", "if-match", "x-b", "if-match", "x-a", "x-c"]
+        .into_iter()
+        .enumerate()
+        .map(|(i, key)| {
+            Ok((
+                HeaderName::from_static(key),
+                HeaderValue::from_str(&i.to_string()).unwrap(),
+            ))
+        });
+    let mut map = HeaderMap::try_from_plan(HeaderMapPlan::for_values(6).unwrap(), fields).unwrap();
+    let pointers = (
+        map.indices.as_ptr(),
+        map.entries.as_ptr(),
+        map.extra_values.as_ptr(),
+    );
+    assert_eq!(
+        map.get_all("x-a")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["0", "4"]
+    );
+    assert!(map.remove(super::IF_MATCH).is_some());
+    map.insert(super::IF_MATCH, HeaderValue::from_static("\"7\""));
+    assert_eq!(map.get_all(super::IF_MATCH).iter().count(), 1);
+    assert_eq!(
+        pointers,
+        (
+            map.indices.as_ptr(),
+            map.entries.as_ptr(),
+            map.extra_values.as_ptr()
+        )
+    );
+    assert!(map.danger.is_red());
 }
 
 #[test]

@@ -68,6 +68,19 @@ enum Inner {
 }
 
 impl Method {
+    /// Converts bytes to a method, retaining shared `Bytes` backing for long
+    /// extension methods. Other inputs are copied as in `from_bytes`.
+    pub fn from_maybe_shared<T: AsRef<[u8]> + 'static>(src: T) -> Result<Method, InvalidMethod> {
+        if_downcast_into!(T, bytes::Bytes, src, {
+            if src.len() <= InlineExtension::MAX {
+                return Self::from_bytes(&src);
+            }
+            return AllocatedExtension::from_shared(src)
+                .map(|value| Method(ExtensionAllocated(value)));
+        });
+        Self::from_bytes(src.as_ref())
+    }
+
     /// GET
     pub const GET: Method = Method(Get);
 
@@ -334,7 +347,7 @@ mod extension {
 
     #[derive(Clone, PartialEq, Eq, Hash)]
     // Invariant: self.0 contains valid UTF-8.
-    pub struct AllocatedExtension(Box<[u8]>);
+    pub struct AllocatedExtension(bytes::Bytes);
 
     impl InlineExtension {
         // Method::from_bytes() assumes this is at least 7
@@ -366,7 +379,14 @@ mod extension {
 
             // Invariant: data is exactly src.len() long and write_checked
             // ensures that the first src.len() bytes of data are valid UTF-8.
-            Ok(AllocatedExtension(data.into_boxed_slice()))
+            Ok(AllocatedExtension(data.into()))
+        }
+
+        pub fn from_shared(src: bytes::Bytes) -> Result<AllocatedExtension, InvalidMethod> {
+            if src.iter().any(|b| METHOD_CHARS[*b as usize] == 0) {
+                return Err(InvalidMethod::new());
+            }
+            Ok(AllocatedExtension(src))
         }
 
         pub fn as_str(&self) -> &str {
