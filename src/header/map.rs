@@ -4311,6 +4311,61 @@ fn projection_interleaved_duplicates_and_replacement_keep_buffers() {
 }
 
 #[test]
+fn projection_full_maps_replace_preconditions_without_growth() {
+    for count in [1, 2, 3, 6, 12] {
+        for duplicate in [false, true] {
+            let fields = (0..count).map(|i| {
+                let key = if i == 0 || (duplicate && i == count - 1) {
+                    super::IF_MATCH
+                } else {
+                    HeaderName::from_bytes(format!("x-field-{i}").as_bytes()).unwrap()
+                };
+                Ok((key, HeaderValue::from_static("\"old\"")))
+            });
+            let mut map =
+                HeaderMap::try_from_plan(HeaderMapPlan::for_values(count).unwrap(), fields)
+                    .unwrap();
+            let pointers = (
+                map.indices.as_ptr(),
+                map.entries.as_ptr(),
+                map.extra_values.as_ptr(),
+            );
+            let capacities = (
+                map.indices.len(),
+                map.entries.capacity(),
+                map.extra_values.capacity(),
+            );
+            let replacement = HeaderValue::from_static("\"7\"");
+            if map.get_all(super::IF_MATCH).iter().count() == 1 {
+                *map.get_mut(super::IF_MATCH).unwrap() = replacement;
+            } else {
+                assert!(map.remove(super::IF_MATCH).is_some());
+                map.insert(super::IF_MATCH, replacement);
+            }
+            assert_eq!(map.get_all(super::IF_MATCH).iter().count(), 1);
+            assert_eq!(map[super::IF_MATCH], "\"7\"");
+            assert_eq!(
+                pointers,
+                (
+                    map.indices.as_ptr(),
+                    map.entries.as_ptr(),
+                    map.extra_values.as_ptr()
+                )
+            );
+            assert_eq!(
+                capacities,
+                (
+                    map.indices.len(),
+                    map.entries.capacity(),
+                    map.extra_values.capacity()
+                )
+            );
+            assert!(map.danger.is_red());
+        }
+    }
+}
+
+#[test]
 fn skip_duplicates_during_key_iteration() {
     let mut map = HeaderMap::new();
     map.try_append("a", HeaderValue::from_static("a")).unwrap();
